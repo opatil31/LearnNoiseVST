@@ -30,6 +30,8 @@ from .alternating_trainer import (
     TrainerConfig,
     AlternatingTrainer,
     LightweightTrainer,
+    StagedTrainerConfig,
+    StagedTrainer,
 )
 
 __all__ = [
@@ -57,4 +59,6 @@ __all__ = [
     "TrainerConfig",
     "AlternatingTrainer",
     "LightweightTrainer",
+    "StagedTrainerConfig",
+    "StagedTrainer",
 ]
