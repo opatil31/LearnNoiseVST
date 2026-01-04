@@ -122,6 +122,9 @@ class LeaveOneOutAttentionPooling(nn.Module):
     of other features to each feature's context.
 
     For feature f, attends over all other features {g : g ≠ f}.
+
+    IMPORTANT: To maintain blind-spot property, queries are computed from
+    the LOO mean (not from e_f directly), ensuring ∂c_f/∂e_f = 0.
     """
 
     def __init__(self, embed_dim: int, num_heads: int = 4, dropout: float = 0.0):
@@ -139,6 +142,7 @@ class LeaveOneOutAttentionPooling(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         self.scale = (embed_dim // num_heads) ** -0.5
+        self.eps = 1e-8
 
     def forward(
         self,
@@ -159,10 +163,31 @@ class LeaveOneOutAttentionPooling(nn.Module):
         heads = self.num_heads
         head_dim = H // heads
 
-        # Project to Q, K, V
-        Q = self.q_proj(e)  # [B, d, H]
-        K = self.k_proj(e)
-        V = self.v_proj(e)
+        if mask is None:
+            mask = torch.ones(B, d, device=e.device, dtype=e.dtype)
+
+        # Expand mask for broadcasting: [B, d, 1]
+        mask_expanded = mask.unsqueeze(-1)
+
+        # Masked embeddings
+        e_masked = e * mask_expanded
+
+        # Compute LOO mean for queries (ensures Q_f doesn't depend on e_f)
+        # S = sum of all embeddings: [B, H]
+        S = e_masked.sum(dim=1)
+        n = mask.sum(dim=1, keepdim=True)  # [B, 1]
+
+        # LOO sum: [B, d, H]
+        S_minus_f = S.unsqueeze(1) - e_masked
+        n_minus_f = n.unsqueeze(-1) - mask_expanded  # [B, d, 1]
+
+        # LOO mean for query computation: [B, d, H]
+        loo_mean = S_minus_f / (n_minus_f.clamp(min=1) + self.eps)
+
+        # Project to Q (from LOO mean), K, V (from original embeddings)
+        Q = self.q_proj(loo_mean)  # [B, d, H] - Q_f depends on {e_g : g ≠ f}
+        K = self.k_proj(e)  # [B, d, H]
+        V = self.v_proj(e)  # [B, d, H]
 
         # Reshape for multi-head attention: [B, heads, d, head_dim]
         Q = Q.view(B, d, heads, head_dim).transpose(1, 2)
@@ -173,15 +198,14 @@ class LeaveOneOutAttentionPooling(nn.Module):
         attn = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
         # Mask out self-attention (diagonal) to enforce LOO property
-        # Set diagonal to -inf so softmax gives 0 weight
+        # Set diagonal to -inf so softmax gives 0 weight to K_f and V_f
         diag_mask = torch.eye(d, device=e.device, dtype=torch.bool)
         attn = attn.masked_fill(diag_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
 
         # Apply missingness mask if provided
-        if mask is not None:
-            # mask: [B, d] -> [B, 1, 1, d] for key masking
-            key_mask = mask.unsqueeze(1).unsqueeze(2)
-            attn = attn.masked_fill(~key_mask.bool(), float('-inf'))
+        # mask: [B, d] -> [B, 1, 1, d] for key masking
+        key_mask = mask.unsqueeze(1).unsqueeze(2)
+        attn = attn.masked_fill(~key_mask.bool(), float('-inf'))
 
         # Softmax and dropout
         attn = F.softmax(attn, dim=-1)
