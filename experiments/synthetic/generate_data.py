@@ -450,6 +450,89 @@ def generate_challenging(
     )
 
 
+def generate_correlated_latent(
+    n_samples: int,
+    n_features: int,
+    latent_dim: int = 3,
+    signal_range: Tuple[float, float] = (1, 100),
+    trend_scale: float = 0.3,
+    noise_model: str = "poisson_like",
+    noise_cv: float = 0.2,
+    seed: Optional[int] = None,
+) -> SyntheticDataset:
+    """
+    Generate correlated data via shared latent factors plus smooth trends.
+
+    Args:
+        n_samples: Number of samples.
+        n_features: Number of features.
+        latent_dim: Latent dimensionality for shared correlations.
+        signal_range: (min, max) for scaled signal generation.
+        trend_scale: Amplitude of smooth per-feature trend.
+        noise_model: "poisson_like" or "multiplicative".
+        noise_cv: Coefficient of variation for multiplicative noise.
+        seed: Random seed.
+
+    Returns:
+        SyntheticDataset with correlated clean signal.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    h = np.random.randn(n_samples, latent_dim)
+    w = np.random.randn(latent_dim, n_features)
+    mu_latent = h @ w
+
+    mu_latent = (mu_latent - mu_latent.mean(axis=0, keepdims=True)) / (
+        mu_latent.std(axis=0, keepdims=True) + 1e-8
+    )
+
+    t = np.linspace(0.0, 1.0, n_samples).reshape(-1, 1)
+    freq = np.random.uniform(1.0, 3.0, size=(1, n_features))
+    phase = np.random.uniform(0.0, 2 * np.pi, size=(1, n_features))
+    slope = np.random.uniform(-trend_scale, trend_scale, size=(1, n_features))
+    trend = trend_scale * np.sin(2 * np.pi * t * freq + phase) + slope * t
+
+    mu = mu_latent + trend
+    mu_min = mu.min()
+    mu_max = mu.max()
+    mu = (mu - mu_min) / (mu_max - mu_min + 1e-8)
+    mu = signal_range[0] + mu * (signal_range[1] - signal_range[0])
+
+    if noise_model == "multiplicative":
+        noise_mult = 1 + np.random.randn(n_samples, n_features) * noise_cv
+        x = mu * noise_mult
+        x = np.maximum(x, 0.1)
+        sigma = mu * noise_cv
+        oracle_transform = log_transform
+        oracle_inverse = log_inverse
+        oracle_derivative = log_derivative
+        noise_type = "correlated_multiplicative"
+    else:
+        sigma = np.sqrt(mu)
+        noise = np.random.randn(n_samples, n_features) * sigma
+        x = mu + noise
+        x = np.maximum(x, 0.1)
+        oracle_transform = anscombe_transform
+        oracle_inverse = anscombe_inverse
+        oracle_derivative = anscombe_derivative
+        noise_type = "correlated_poisson_like"
+
+    return SyntheticDataset(
+        x=x,
+        mu=mu,
+        sigma=sigma,
+        oracle_transform=oracle_transform,
+        oracle_inverse=oracle_inverse,
+        oracle_derivative=oracle_derivative,
+        noise_type=noise_type,
+        description=(
+            f"Correlated latent ({latent_dim}D) + smooth trend, "
+            f"{noise_model} noise, signal range {signal_range}"
+        ),
+    )
+
+
 # ============================================================================
 # Dataset Splitting
 # ============================================================================
@@ -536,6 +619,9 @@ def get_benchmark_datasets(
         ),
         "challenging": generate_challenging(
             n_samples, n_features, seed=seed + 6
+        ),
+        "correlated": generate_correlated_latent(
+            n_samples, n_features, seed=seed + 7
         ),
     }
 
