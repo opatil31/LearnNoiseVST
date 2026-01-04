@@ -589,10 +589,11 @@ class StagedTrainerConfig:
     homoscedastic (Gaussian) input. If trained on heteroscedastic data, the
     denoiser adapts and removes the VST learning signal.
 
-    By training Stage 1 with synthetic Gaussian noise:
-    - Denoiser learns to expect homoscedastic input
+    By pre-training the denoiser OFFLINE on purely synthetic Gaussian data:
+    - Denoiser learns to expect homoscedastic input (never sees target data)
     - In Stage 2, if VST doesn't stabilize variance, denoiser performs poorly
     - This creates strong gradient signal for VST to learn proper stabilization
+    - Stage 3 then adapts the denoiser to actual data for Phase 4 noise characterization
     """
 
     # Stage 1: Denoiser warmup with SYNTHETIC GAUSSIAN noise
@@ -621,6 +622,7 @@ class StagedTrainerConfig:
     lambda_binned: float = 10.0
     lambda_shape: float = 0.1
     lambda_reg: float = 0.01
+    lambda_smooth: float = 0.1  # Smoothness regularization for transform
 
     # Gauge-fixing
     gauge_momentum: float = 0.1
@@ -635,26 +637,28 @@ class StagedTrainerConfig:
 
 class StagedTrainer:
     """
-    Staged training for VST learning with synthetic Gaussian noise pre-training.
+    Staged training for VST learning with offline Gaussian denoiser pre-training.
 
     This trainer implements key insights from Noise2VST:
     1. The frozen denoiser should EXPECT homoscedastic (Gaussian) input
     2. Freezing the denoiser during VST training provides clear gradient signals
 
-    The key innovation is Stage 1: instead of training the denoiser on the actual
-    heteroscedastic data (which allows it to adapt), we train it with SYNTHETIC
-    GAUSSIAN noise. This ensures:
-    - Denoiser learns to denoise homoscedastic noise
-    - In Stage 2, if VST doesn't stabilize variance, denoiser performs poorly
-    - Poor denoiser performance → high loss → strong VST gradient signal
+    The key innovation is Stage 1: we pre-train the denoiser OFFLINE on purely
+    synthetic data with known Gaussian noise. This is similar to how Noise2VST
+    uses a denoiser pre-trained on external datasets (like ImageNet). The denoiser
+    never sees the target data during pre-training, so it learns to expect
+    homoscedastic Gaussian noise.
 
     Training Stages:
-        Stage 1 (Warmup): Train denoiser with SYNTHETIC GAUSSIAN noise
-        Stage 2 (VST Focus): Freeze denoiser, train VST (key improvement)
-        Stage 3 (Refinement): Joint fine-tuning with low learning rates
+        Stage 1 (Pre-training): Train denoiser OFFLINE on synthetic Gaussian data
+                               (no target data used - purely synthetic clean + noise)
+        Stage 2 (VST Focus): Freeze pre-trained denoiser, train VST
+                            (key stage - VST gets 100% gradient signal)
+        Stage 3 (Adaptation): Joint fine-tuning - denoiser adapts to actual data
+                             (prepares for Phase 4 noise characterization)
 
-    This preserves noise characterization capability while fixing the VST
-    learning failure mode observed with heteroscedastic Stage 1 training.
+    After Stage 3, the denoiser has adapted to the actual noise structure in
+    z-space, so its residuals can be used for Phase 4 noise model fitting.
 
     Args:
         transform: The monotone transform module.
@@ -734,52 +738,44 @@ class StagedTrainer:
         for param in module.parameters():
             param.requires_grad = True
 
-    def _train_denoiser_epoch_synthetic(
+    def _pretrain_denoiser_offline(
         self,
-        dataloader: DataLoader,
         optimizer: optim.Optimizer,
-        max_iters: int,
+        num_iterations: int,
+        batch_size: int,
         noise_std: float,
     ) -> Dict[str, float]:
         """
-        Train denoiser for one epoch with SYNTHETIC GAUSSIAN noise.
+        Pre-train denoiser OFFLINE on purely synthetic Gaussian data.
 
-        This is the key innovation for Stage 1: instead of using the natural
-        heteroscedastic noise in the data, we add synthetic homoscedastic
-        Gaussian noise. This ensures the denoiser learns to expect constant
-        variance input.
+        This is the key innovation: the denoiser is trained on synthetic data
+        that has NOTHING to do with the target data. We generate random clean
+        signals, add known Gaussian noise, and train the denoiser. This ensures
+        the denoiser learns to expect homoscedastic Gaussian noise.
+
+        This mimics Noise2VST's use of a pre-trained Gaussian denoiser that was
+        trained on external datasets (like ImageNet with Gaussian noise).
 
         Args:
-            dataloader: Data loader
             optimizer: Denoiser optimizer
-            max_iters: Max iterations per epoch
-            noise_std: Standard deviation of synthetic Gaussian noise
+            num_iterations: Number of training iterations
+            batch_size: Batch size for synthetic data
+            noise_std: Standard deviation of Gaussian noise to add
         """
-        self._freeze_module(self.transform)
         self._unfreeze_module(self.denoiser)
+        num_features = getattr(self.transform, 'num_features', 1)
 
         total_loss = 0.0
         total_mse = 0.0
-        num_batches = 0
 
-        for i, batch in enumerate(dataloader):
-            if i >= max_iters:
-                break
+        for i in range(num_iterations):
+            # Generate PURELY SYNTHETIC clean signals
+            # Use standard normal distribution (will be similar to z-space after gauge-fixing)
+            z_clean = torch.randn(batch_size, num_features, device=self.device)
 
-            if isinstance(batch, (tuple, list)):
-                x = batch[0]
-            else:
-                x = batch
-            x = x.to(self.device)
-
-            # Forward through frozen transform to get "clean" signal
-            with torch.no_grad():
-                z_clean = self.transform(x)
-
-            # Add SYNTHETIC GAUSSIAN noise (homoscedastic!)
-            # This is the key: denoiser learns to expect constant variance
-            synthetic_noise = torch.randn_like(z_clean) * noise_std
-            z_noisy = z_clean + synthetic_noise
+            # Add known Gaussian noise (homoscedastic!)
+            noise = torch.randn_like(z_clean) * noise_std
+            z_noisy = z_clean + noise
 
             # Denoiser tries to predict clean from noisy
             z_hat = self.denoiser(z_noisy)
@@ -795,11 +791,10 @@ class StagedTrainer:
 
             total_loss += loss.item()
             total_mse += loss.item()
-            num_batches += 1
 
         return {
-            "loss": total_loss / max(num_batches, 1),
-            "mse": total_mse / max(num_batches, 1),
+            "loss": total_loss / num_iterations,
+            "mse": total_mse / num_iterations,
         }
 
     def _train_denoiser_epoch(
@@ -1042,20 +1037,21 @@ class StagedTrainer:
         Returns:
             Training result dictionary with history.
         """
-        logger.info("Starting staged training with SYNTHETIC GAUSSIAN noise in Stage 1")
-        logger.info(f"Stage 1: {self.config.warmup_epochs} epochs denoiser warmup (synthetic noise σ={self.config.warmup_noise_std})")
+        logger.info("Starting staged training with OFFLINE denoiser pre-training")
+        logger.info(f"Stage 1: {self.config.warmup_epochs} epochs OFFLINE pre-training (synthetic noise σ={self.config.warmup_noise_std})")
         logger.info(f"Stage 2: {self.config.vst_epochs} epochs VST training (frozen denoiser)")
-        logger.info(f"Stage 3: {self.config.refine_epochs} epochs joint refinement")
+        logger.info(f"Stage 3: {self.config.refine_epochs} epochs joint refinement (denoiser adapts)")
 
         start_time = time.time()
         global_epoch = 0
 
-        # ===== STAGE 1: Denoiser Warmup with SYNTHETIC GAUSSIAN noise =====
+        # ===== STAGE 1: OFFLINE Denoiser Pre-training =====
         self.current_stage = 1
         logger.info("\n" + "=" * 60)
-        logger.info("STAGE 1: Denoiser Warmup with SYNTHETIC GAUSSIAN noise")
+        logger.info("STAGE 1: OFFLINE Denoiser Pre-training")
+        logger.info("  Training on PURELY SYNTHETIC data (no target data used!)")
         logger.info(f"  Noise std: {self.config.warmup_noise_std}")
-        logger.info("  Key insight: Denoiser learns to expect homoscedastic input")
+        logger.info("  Key insight: Denoiser learns to expect homoscedastic Gaussian input")
         logger.info("=" * 60)
 
         denoiser_optimizer = optim.Adam(
@@ -1063,11 +1059,15 @@ class StagedTrainer:
             lr=self.config.warmup_denoiser_lr,
         )
 
+        # Calculate total iterations for pre-training
+        iters_per_epoch = self.config.warmup_inner_iters
+
         for epoch in range(self.config.warmup_epochs):
-            # Use synthetic Gaussian noise training!
-            results = self._train_denoiser_epoch_synthetic(
-                dataloader, denoiser_optimizer,
-                max_iters=self.config.warmup_inner_iters,
+            # OFFLINE pre-training: purely synthetic data, no target data
+            results = self._pretrain_denoiser_offline(
+                optimizer=denoiser_optimizer,
+                num_iterations=iters_per_epoch,
+                batch_size=self.config.batch_size,
                 noise_std=self.config.warmup_noise_std,
             )
 
@@ -1080,7 +1080,7 @@ class StagedTrainer:
             if epoch % self.config.log_every == 0:
                 logger.info(
                     f"Stage 1 Epoch {epoch}/{self.config.warmup_epochs} "
-                    f"D_loss={results['loss']:.4f} MSE={results['mse']:.4f}"
+                    f"D_loss={results['loss']:.4f} MSE={results['mse']:.4f} (offline)"
                 )
 
             if callback:
@@ -1131,11 +1131,13 @@ class StagedTrainer:
 
             global_epoch += 1
 
-        # ===== STAGE 3: Joint Refinement =====
+        # ===== STAGE 3: Joint Refinement & Denoiser Adaptation =====
         if self.config.refine_epochs > 0:
             self.current_stage = 3
             logger.info("\n" + "=" * 60)
-            logger.info("STAGE 3: Joint Refinement (low learning rates)")
+            logger.info("STAGE 3: Joint Refinement & Denoiser Adaptation")
+            logger.info("  Denoiser adapts to actual z-space noise structure")
+            logger.info("  After this stage, residuals can be used for Phase 4 noise characterization")
             logger.info("=" * 60)
 
             transform_optimizer = optim.Adam(

@@ -2,14 +2,18 @@
 """
 Staged training experiment for learnable VST.
 
-This script uses the StagedTrainer which implements the key insight from
-Noise2VST: freezing the denoiser during VST training provides clearer
-gradient signals for variance stabilization.
+This script uses the StagedTrainer which implements key insights from Noise2VST:
+1. Pre-train denoiser OFFLINE on purely synthetic Gaussian data
+2. Freeze denoiser during VST training for clear gradient signals
+3. Adapt denoiser to actual data for Phase 4 noise characterization
 
 Training Stages:
-    Stage 1 (Warmup): Train denoiser with current transform
-    Stage 2 (VST Focus): Freeze denoiser, train VST (key improvement)
-    Stage 3 (Refinement): Joint fine-tuning with low learning rates
+    Stage 1 (Pre-training): Train denoiser OFFLINE on synthetic Gaussian data
+                           (no target data used - purely synthetic clean + noise)
+    Stage 2 (VST Focus): Freeze pre-trained denoiser, train VST
+                        (key stage - VST gets 100% gradient signal)
+    Stage 3 (Adaptation): Joint fine-tuning - denoiser adapts to actual data
+                         (prepares residuals for Phase 4 noise characterization)
 
 Usage:
     python run_staged.py --dataset multiplicative --output_dir results/staged
@@ -571,18 +575,19 @@ def main():
 
     if verbose:
         print("=" * 60)
-        print("STAGED VST Experiment (with Synthetic Gaussian Noise)")
+        print("STAGED VST Experiment (with OFFLINE Denoiser Pre-training)")
         print("=" * 60)
         print(f"Device: {device}")
         print(f"Dataset: {args.dataset}")
         print(f"Samples: {args.n_samples}, Features: {args.n_features}")
         print(f"Training Stages:")
-        print(f"  Stage 1 (Warmup):  {args.warmup_epochs} epochs (synthetic noise σ={args.noise_std})")
-        print(f"  Stage 2 (VST):     {args.vst_epochs} epochs (frozen denoiser)")
-        print(f"  Stage 3 (Refine):  {args.refine_epochs} epochs")
-        print(f"\nKey insight: Stage 1 uses SYNTHETIC Gaussian noise so denoiser")
-        print(f"             expects homoscedastic input. This creates strong")
-        print(f"             gradient signal for VST learning in Stage 2.")
+        print(f"  Stage 1 (Pre-train): {args.warmup_epochs} epochs OFFLINE (σ={args.noise_std})")
+        print(f"  Stage 2 (VST):       {args.vst_epochs} epochs (frozen denoiser)")
+        print(f"  Stage 3 (Adapt):     {args.refine_epochs} epochs (denoiser adapts)")
+        print(f"\nKey insight: Stage 1 pre-trains denoiser on PURELY SYNTHETIC data")
+        print(f"             (no target data used). Denoiser expects homoscedastic")
+        print(f"             Gaussian input, creating strong VST gradient signal.")
+        print(f"             Stage 3 adapts denoiser for Phase 4 noise characterization.")
 
     # Create staged training config
     config = StagedTrainerConfig(
