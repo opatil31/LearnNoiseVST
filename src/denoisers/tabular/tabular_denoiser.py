@@ -303,9 +303,15 @@ class LightweightTabularDenoiser(TabularBlindSpotDenoiser):
 
 class DeepTabularDenoiser(TabularBlindSpotDenoiser):
     """
-    Deeper tabular denoiser with multiple LOO pooling layers.
+    Deeper tabular denoiser with expressive per-position processing.
 
-    Uses a stack of LOO attention layers for more expressive modeling.
+    Architecture ensures blind-spot property by:
+    1. Embedding all features
+    2. Applying a SINGLE LOO layer to get blind-spot context (c_f depends on {z_g : g ≠ f})
+    3. Processing with per-position FFN layers (no cross-position mixing)
+
+    Note: Stacking multiple LOO layers breaks blind-spot because the second layer's
+    output at position f depends on position g's output (g≠f), which depends on z_f.
     """
 
     def __init__(
@@ -325,12 +331,14 @@ class DeepTabularDenoiser(TabularBlindSpotDenoiser):
         self.input_embed = nn.Linear(2, embed_dim)  # (value, mask)
         self.feature_embed = nn.Embedding(num_features, embed_dim)
 
-        # Stack of LOO attention layers
-        self.layers = nn.ModuleList()
+        # Single LOO attention layer (to maintain blind-spot property)
+        self.loo_attn = LeaveOneOutAttentionPooling(embed_dim, num_heads, dropout)
+        self.loo_norm = nn.LayerNorm(embed_dim)
+
+        # Per-position FFN layers (no cross-position mixing, so blind-spot is preserved)
+        self.ffn_layers = nn.ModuleList()
         for _ in range(num_layers):
-            self.layers.append(nn.ModuleDict({
-                'attn': LeaveOneOutAttentionPooling(embed_dim, num_heads, dropout),
-                'norm1': nn.LayerNorm(embed_dim),
+            self.ffn_layers.append(nn.ModuleDict({
                 'ffn': nn.Sequential(
                     nn.Linear(embed_dim, hidden_dim),
                     nn.GELU(),
@@ -338,7 +346,7 @@ class DeepTabularDenoiser(TabularBlindSpotDenoiser):
                     nn.Linear(hidden_dim, embed_dim),
                     nn.Dropout(dropout),
                 ),
-                'norm2': nn.LayerNorm(embed_dim),
+                'norm': nn.LayerNorm(embed_dim),
             }))
 
         # Output head
@@ -362,17 +370,17 @@ class DeepTabularDenoiser(TabularBlindSpotDenoiser):
         feature_ids = torch.arange(d, device=z.device)
         x = x + self.feature_embed(feature_ids).unsqueeze(0)
 
-        # Process through layers
-        for layer in self.layers:
-            # LOO attention (with residual)
-            attn_out = layer['attn'](layer['norm1'](x), mask)
-            x = x + attn_out
+        # Single LOO attention to get blind-spot context
+        # c_f depends only on {x_g : g ≠ f}, hence only on {z_g : g ≠ f}
+        c = self.loo_attn(self.loo_norm(x), mask)  # [B, d, H]
 
-            # FFN (with residual)
-            ffn_out = layer['ffn'](layer['norm2'](x))
-            x = x + ffn_out
+        # Process through per-position FFN layers (with residual)
+        # Since FFN is per-position, it doesn't mix positions, so blind-spot is preserved
+        for layer in self.ffn_layers:
+            ffn_out = layer['ffn'](layer['norm'](c))
+            c = c + ffn_out
 
         # Output
-        z_hat = self.output_head(x).squeeze(-1)  # [B, d]
+        z_hat = self.output_head(c).squeeze(-1)  # [B, d]
 
         return z_hat
