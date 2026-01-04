@@ -593,6 +593,10 @@ class StagedTrainerConfig:
     - Denoiser learns to expect homoscedastic input
     - In Stage 2, if VST doesn't stabilize variance, denoiser performs poorly
     - This creates strong gradient signal for VST to learn proper stabilization
+
+    IMPORTANT: For Stage 1 to work correctly, we need CLEAN targets. For synthetic
+    data, use the true means. For real data, consider pre-training offline or
+    using self-supervised objectives.
     """
 
     # Stage 1: Denoiser warmup with SYNTHETIC GAUSSIAN noise
@@ -621,6 +625,7 @@ class StagedTrainerConfig:
     lambda_binned: float = 10.0
     lambda_shape: float = 0.1
     lambda_reg: float = 0.01
+    lambda_smooth: float = 0.1  # Smoothness regularization for transform
 
     # Gauge-fixing
     gauge_momentum: float = 0.1
