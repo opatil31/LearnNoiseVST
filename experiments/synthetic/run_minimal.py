@@ -277,13 +277,41 @@ def create_visualizations(
     z_hat = results['z_hat']
     history = results['history']
 
-    # 1. Transform comparison
+    # 1. Transform comparison (using first feature for multi-feature transforms)
     if dataset.oracle_transform is not None:
+        n_features = dataset.x.shape[1] if dataset.x.ndim > 1 else 1
+        transform_model = results['models']['transform']
+
+        # Create wrapper that applies transform to a single feature
+        def learned_transform_1d(x_1d):
+            """Wrapper to apply multi-feature transform to 1D input."""
+            # x_1d is [N, 1] or [N]
+            if isinstance(x_1d, np.ndarray):
+                x_1d = torch.from_numpy(x_1d).float()
+            if x_1d.dim() == 1:
+                x_1d = x_1d.unsqueeze(1)
+            # Replicate to all features
+            x_full = x_1d.expand(-1, n_features)
+            with torch.no_grad():
+                transform_model.eval()
+                z = transform_model(x_full, update_stats=False)
+            # Return just first feature
+            return z[:, 0].cpu().numpy()
+
+        # Oracle also needs to handle multi-feature
+        def oracle_transform_1d(x_1d):
+            """Wrapper to apply oracle to 1D input."""
+            if x_1d.ndim == 1:
+                x_1d = x_1d.reshape(-1, 1)
+            x_full = np.broadcast_to(x_1d, (len(x_1d), n_features))
+            z = dataset.oracle_transform(x_full)
+            return z[:, 0]
+
         fig = plot_transform_comparison(
-            learned_transform=results['models']['transform'],
-            oracle_transform=dataset.oracle_transform,
+            learned_transform=learned_transform_1d,
+            oracle_transform=oracle_transform_1d,
             x_range=(dataset.x.min(), dataset.x.max()),
-            title=f'Transform Comparison: {dataset.noise_type}',
+            title=f'Transform Comparison: {dataset.noise_type} (feature 0)',
         )
         fig.savefig(figures_dir / 'transform_comparison.png', dpi=150, bbox_inches='tight')
         print(f"  Saved transform_comparison.png")
