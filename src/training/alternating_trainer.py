@@ -554,7 +554,8 @@ class AlternatingTrainer:
 
     def load_checkpoint(self, path: str):
         """Load training checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        # Use weights_only=False since checkpoint contains config objects
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.transform.load_state_dict(checkpoint["transform_state"])
         self.denoiser.load_state_dict(checkpoint["denoiser_state"])
         self.history = checkpoint.get("history", self.history)
