@@ -20,6 +20,7 @@ from typing import Dict, Optional, Tuple, Callable, Union, List
 from dataclasses import dataclass
 import logging
 import time
+import math
 
 from .losses import (
     CombinedTransformLoss,
@@ -773,7 +774,24 @@ class StagedTrainer:
         for i in range(num_iterations):
             # Generate PURELY SYNTHETIC clean signals
             # Use standard normal distribution (will be similar to z-space after gauge-fixing)
-            z_clean = torch.randn(batch_size, num_features, device=self.device)
+            latent_dim = max(1, min(4, num_features))
+            latent_factors = torch.randn(batch_size, latent_dim, device=self.device)
+            mixing = torch.randn(latent_dim, num_features, device=self.device)
+            shared_component = (latent_factors @ mixing) / math.sqrt(latent_dim)
+
+            feature_axis = torch.linspace(
+                0.0, 1.0, num_features, device=self.device
+            )
+            trend_base = torch.sin(2.0 * math.pi * feature_axis)
+            trend_scale = 0.35 * torch.randn(batch_size, 1, device=self.device)
+            trend_component = trend_scale * trend_base
+
+            independent_component = 0.3 * torch.randn(
+                batch_size, num_features, device=self.device
+            )
+            z_clean = shared_component + trend_component + independent_component
+            z_clean = z_clean - z_clean.mean(dim=0, keepdim=True)
+            z_clean = z_clean / z_clean.std(dim=0, keepdim=True).clamp(min=1e-6)
 
             # Add known Gaussian noise (homoscedastic!)
             noise = torch.randn_like(z_clean) * noise_std
