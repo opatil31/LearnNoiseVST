@@ -812,6 +812,9 @@ class StagedTrainer:
         - Low variance = smooth derivative
         - High variance = oscillatory derivative
 
+        NOTE: We do NOT penalize deviation from derivative=1, because for
+        transforms like log(x), the derivative varies significantly (1/x).
+
         Args:
             x: Input samples [batch, features]
             log_deriv: Pre-computed log derivatives, or None to compute
@@ -827,14 +830,9 @@ class StagedTrainer:
 
         # Penalize variance of log-derivative within each feature
         # High variance = oscillatory derivative
-        log_deriv_var = log_deriv.var(dim=0).mean()
-
-        # Also penalize extreme derivatives (very large or very small)
-        # This prevents the transform from being too steep or too flat
-        log_deriv_extreme = (log_deriv.abs() - 1.0).pow(2).mean()
-
-        # Combined smoothness loss
-        smooth_loss = log_deriv_var + 0.1 * log_deriv_extreme
+        # This allows the derivative to vary smoothly (like 1/x for log transform)
+        # but penalizes rapid oscillations
+        smooth_loss = log_deriv.var(dim=0).mean()
 
         return smooth_loss
 
