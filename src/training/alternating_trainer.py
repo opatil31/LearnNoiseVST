@@ -797,6 +797,47 @@ class StagedTrainer:
             "mse": total_mse / num_iterations,
         }
 
+    def _compute_smoothness_loss(
+        self,
+        x: torch.Tensor,
+        log_deriv: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute smoothness regularization loss to prevent oscillatory derivatives.
+
+        The smoothness loss penalizes rapid changes in the transform derivative,
+        encouraging a smooth monotone function rather than an oscillatory one.
+
+        We use the variance of the log-derivative as a smoothness measure:
+        - Low variance = smooth derivative
+        - High variance = oscillatory derivative
+
+        Args:
+            x: Input samples [batch, features]
+            log_deriv: Pre-computed log derivatives, or None to compute
+
+        Returns:
+            Smoothness loss (scalar tensor)
+        """
+        if log_deriv is None:
+            if hasattr(self.transform, 'log_derivative'):
+                log_deriv = self.transform.log_derivative(x)
+            else:
+                return torch.tensor(0.0, device=self.device)
+
+        # Penalize variance of log-derivative within each feature
+        # High variance = oscillatory derivative
+        log_deriv_var = log_deriv.var(dim=0).mean()
+
+        # Also penalize extreme derivatives (very large or very small)
+        # This prevents the transform from being too steep or too flat
+        log_deriv_extreme = (log_deriv.abs() - 1.0).pow(2).mean()
+
+        # Combined smoothness loss
+        smooth_loss = log_deriv_var + 0.1 * log_deriv_extreme
+
+        return smooth_loss
+
     def _train_denoiser_epoch(
         self,
         dataloader: DataLoader,
@@ -852,7 +893,12 @@ class StagedTrainer:
         optimizer: optim.Optimizer,
         max_iters: int,
     ) -> Dict[str, float]:
-        """Train transform for one epoch with frozen denoiser."""
+        """Train transform for one epoch with frozen denoiser.
+
+        Key fix: Normalize z to N(0,1) before feeding to denoiser, since the
+        denoiser was pre-trained on N(0,1) input. This ensures the denoiser
+        operates in its expected input domain.
+        """
         self._unfreeze_module(self.transform)
         self._freeze_module(self.denoiser)
 
@@ -860,6 +906,7 @@ class StagedTrainer:
         total_homo = 0.0
         total_vf = 0.0
         total_binned = 0.0
+        total_smooth = 0.0
         num_batches = 0
 
         for i, batch in enumerate(dataloader):
@@ -875,14 +922,23 @@ class StagedTrainer:
             # Forward through transform
             z = self.transform(x)
 
-            # Get denoiser predictions (no grad)
-            with torch.no_grad():
-                z_hat = self.denoiser(z)
+            # CRITICAL FIX: Normalize z to N(0,1) before denoiser
+            # The denoiser was pre-trained on N(0,1) input, so we must match that
+            z_mean = z.mean(dim=0, keepdim=True)
+            z_std = z.std(dim=0, keepdim=True).clamp(min=1e-6)
+            z_normalized = (z - z_mean) / z_std
 
-            # Compute residuals
+            # Get denoiser predictions on normalized input (no grad)
+            with torch.no_grad():
+                z_hat_normalized = self.denoiser(z_normalized)
+
+            # Denormalize z_hat back to original scale
+            z_hat = z_hat_normalized * z_std + z_mean
+
+            # Compute residuals in original scale
             residuals = z - z_hat
 
-            # Get log derivatives
+            # Get log derivatives for smoothness regularization
             if hasattr(self.transform, 'log_derivative'):
                 log_deriv = self.transform.log_derivative(x)
             else:
@@ -897,19 +953,24 @@ class StagedTrainer:
                 x_samples=x,
             )
 
+            # Add smoothness regularization to prevent oscillatory derivatives
+            smooth_loss = self._compute_smoothness_loss(x, log_deriv)
+            total = losses["total"] + self.config.lambda_smooth * smooth_loss
+
             # Backward
             optimizer.zero_grad()
-            losses["total"].backward()
+            total.backward()
             torch.nn.utils.clip_grad_norm_(self.transform.parameters(), 1.0)
             optimizer.step()
 
             # Update gauge-fixing stats
             self.gauge_manager.update_batch(x)
 
-            total_loss += losses["total"].item()
+            total_loss += total.item()
             total_homo += losses.get("homo", 0.0)
             total_vf += losses.get("vf", 0.0)
             total_binned += losses.get("binned", 0.0)
+            total_smooth += smooth_loss.item()
             num_batches += 1
 
         return {
@@ -917,6 +978,7 @@ class StagedTrainer:
             "homo": total_homo / max(num_batches, 1),
             "vf": total_vf / max(num_batches, 1),
             "binned": total_binned / max(num_batches, 1),
+            "smooth": total_smooth / max(num_batches, 1),
         }
 
     def _train_joint_epoch(
@@ -926,7 +988,12 @@ class StagedTrainer:
         denoiser_optimizer: optim.Optimizer,
         max_iters: int,
     ) -> Dict[str, float]:
-        """Train both models jointly for one epoch."""
+        """Train both models jointly for one epoch.
+
+        In Stage 3, the denoiser adapts to the actual z-space distribution.
+        We still use normalization for consistent loss computation, but the
+        denoiser learns the actual data distribution.
+        """
         self._unfreeze_module(self.transform)
         self._unfreeze_module(self.denoiser)
 
@@ -934,6 +1001,7 @@ class StagedTrainer:
         total_d_loss = 0.0
         total_homo = 0.0
         total_binned = 0.0
+        total_smooth = 0.0
         num_batches = 0
 
         for i, batch in enumerate(dataloader):
@@ -950,9 +1018,15 @@ class StagedTrainer:
             self.denoiser.eval()
             z = self.transform(x)
 
-            with torch.no_grad():
-                z_hat = self.denoiser(z)
+            # Normalize z for denoiser (consistent with Stage 2)
+            z_mean = z.mean(dim=0, keepdim=True)
+            z_std = z.std(dim=0, keepdim=True).clamp(min=1e-6)
+            z_normalized = (z - z_mean) / z_std
 
+            with torch.no_grad():
+                z_hat_normalized = self.denoiser(z_normalized)
+
+            z_hat = z_hat_normalized * z_std + z_mean
             residuals = z - z_hat
 
             if hasattr(self.transform, 'log_derivative'):
@@ -965,20 +1039,30 @@ class StagedTrainer:
                 log_deriv=log_deriv, x_samples=x,
             )
 
+            # Add smoothness regularization
+            smooth_loss = self._compute_smoothness_loss(x, log_deriv)
+            t_total = t_losses["total"] + self.config.lambda_smooth * smooth_loss
+
             transform_optimizer.zero_grad()
-            t_losses["total"].backward()
+            t_total.backward()
             torch.nn.utils.clip_grad_norm_(self.transform.parameters(), 1.0)
             transform_optimizer.step()
 
             # === Denoiser step ===
+            # Denoiser learns the actual z-space distribution (for Phase 4)
             self.transform.eval()
             self.denoiser.train()
 
             with torch.no_grad():
                 z = self.transform(x)
+                # Use same normalization for denoiser training
+                z_mean = z.mean(dim=0, keepdim=True)
+                z_std = z.std(dim=0, keepdim=True).clamp(min=1e-6)
+                z_normalized = (z - z_mean) / z_std
 
-            z_hat = self.denoiser(z)
-            d_loss, d_components = self.denoiser_loss_fn(z, z_hat)
+            z_hat_normalized = self.denoiser(z_normalized)
+            # Loss in normalized space
+            d_loss = torch.nn.functional.mse_loss(z_hat_normalized, z_normalized.detach())
 
             denoiser_optimizer.zero_grad()
             d_loss.backward()
@@ -988,8 +1072,9 @@ class StagedTrainer:
             # Update gauge-fixing stats
             self.gauge_manager.update_batch(x)
 
-            total_t_loss += t_losses["total"].item()
+            total_t_loss += t_total.item()
             total_d_loss += d_loss.item()
+            total_smooth += smooth_loss.item()
             total_homo += t_losses.get("homo", 0.0)
             total_binned += t_losses.get("binned", 0.0)
             num_batches += 1
