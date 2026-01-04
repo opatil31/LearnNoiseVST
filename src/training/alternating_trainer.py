@@ -768,6 +768,7 @@ class StagedTrainer:
 
         total_loss = 0.0
         total_mse = 0.0
+        theoretical_mse = (noise_std ** 2) / (1 + noise_std ** 2)
 
         for i in range(num_iterations):
             # Generate PURELY SYNTHETIC clean signals
@@ -793,9 +794,16 @@ class StagedTrainer:
             total_loss += loss.item()
             total_mse += loss.item()
 
+        avg_mse = total_mse / num_iterations
+        logger.info(
+            "Stage 1 offline denoiser MSE: actual=%.6f, theoretical=%.6f",
+            avg_mse,
+            theoretical_mse,
+        )
+
         return {
             "loss": total_loss / num_iterations,
-            "mse": total_mse / num_iterations,
+            "mse": avg_mse,
         }
 
     def _compute_smoothness_loss(

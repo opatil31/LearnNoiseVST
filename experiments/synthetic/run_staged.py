@@ -55,6 +55,7 @@ from experiments.synthetic.generate_data import (
     generate_affine_variance,
     generate_homoscedastic,
     generate_mixed,
+    generate_correlated_latent,
     get_benchmark_datasets,
     SyntheticDataset,
 )
@@ -481,7 +482,15 @@ def main():
         '--dataset',
         type=str,
         default='multiplicative',
-        choices=['poisson_like', 'multiplicative', 'affine', 'homoscedastic', 'mixed', 'all'],
+        choices=[
+            'poisson_like',
+            'multiplicative',
+            'affine',
+            'homoscedastic',
+            'mixed',
+            'correlated',
+            'all',
+        ],
         help='Dataset type to use'
     )
     parser.add_argument(
@@ -614,6 +623,7 @@ def main():
             'affine': generate_affine_variance,
             'homoscedastic': generate_homoscedastic,
             'mixed': generate_mixed,
+            'correlated': generate_correlated_latent,
         }
         datasets = {
             args.dataset: generators[args.dataset](
