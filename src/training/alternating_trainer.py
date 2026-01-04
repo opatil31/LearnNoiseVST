@@ -623,6 +623,7 @@ class StagedTrainerConfig:
     lambda_shape: float = 0.1
     lambda_reg: float = 0.01
     lambda_smooth: float = 0.1  # Smoothness regularization for transform
+    lambda_collapse: float = 1.0  # Collapse prevention (operates on pre-normalized output)
 
     # Gauge-fixing
     gauge_momentum: float = 0.1
@@ -836,6 +837,63 @@ class StagedTrainer:
 
         return smooth_loss
 
+    def _compute_collapse_loss(
+        self,
+        s: torch.Tensor,
+        x: torch.Tensor,
+        min_output_std: float = 0.5,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute collapse prevention loss using pre-normalized transform output.
+
+        This loss operates on `s` (RQS output BEFORE gauge-fixing) to detect
+        and prevent output collapse. Gauge-fixing can hide collapse by rescaling
+        tiny outputs to unit variance, so we must monitor the raw output.
+
+        Two components:
+        1. Output range loss: Penalize when std(s) is too small
+        2. Signal preservation: Penalize when correlation between x and s is too low
+
+        Args:
+            s: Pre-normalized transform output [batch, features]
+            x: Original input [batch, features]
+            min_output_std: Minimum acceptable std for s
+
+        Returns:
+            Tuple of (collapse_loss, metrics_dict)
+        """
+        # 1. Output range loss: ensure transform produces meaningful output range
+        s_std = s.std(dim=0)  # Per-feature std
+        # Penalize when std is below threshold using soft hinge
+        range_loss = torch.nn.functional.relu(min_output_std - s_std).mean()
+
+        # 2. Signal preservation: correlation between input and output
+        # For monotone transform, |corr(x, s)| should be close to 1
+        # Low correlation means signal information is being lost
+        x_centered = x - x.mean(dim=0, keepdim=True)
+        s_centered = s - s.mean(dim=0, keepdim=True)
+
+        # Compute correlation per feature
+        x_std = x_centered.std(dim=0).clamp(min=1e-8)
+        s_std_safe = s_centered.std(dim=0).clamp(min=1e-8)
+        correlation = (x_centered * s_centered).mean(dim=0) / (x_std * s_std_safe)
+
+        # Penalize low absolute correlation (should be near ±1 for monotone transform)
+        # Use (1 - |corr|)^2 as loss
+        signal_loss = ((1 - correlation.abs()) ** 2).mean()
+
+        # Combined loss
+        collapse_loss = range_loss + signal_loss
+
+        metrics = {
+            "s_std": s_std.mean().item(),
+            "correlation": correlation.abs().mean().item(),
+            "range_loss": range_loss.item(),
+            "signal_loss": signal_loss.item(),
+        }
+
+        return collapse_loss, metrics
+
     def _train_denoiser_epoch(
         self,
         dataloader: DataLoader,
@@ -893,10 +951,14 @@ class StagedTrainer:
     ) -> Dict[str, float]:
         """Train transform for one epoch with frozen denoiser.
 
-        The transform's built-in gauge-fixing already normalizes output to N(0,1).
-        We rely on that instead of additional batch normalization, so that if the
-        transform collapses, the denoiser will see non-standard input and fail,
-        providing gradient signal to fix the collapse.
+        Key insight: We monitor the PRE-NORMALIZED transform output (before
+        gauge-fixing) to detect and prevent collapse. Gauge-fixing can hide
+        collapse by rescaling tiny outputs to unit variance.
+
+        Loss components:
+        1. Binned variance loss: Encourage flat variance across signal levels
+        2. Smoothness loss: Prevent oscillatory derivatives
+        3. Collapse loss: Prevent output collapse (monitors pre-normalized output)
         """
         self._unfreeze_module(self.transform)
         self._freeze_module(self.denoiser)
@@ -906,6 +968,9 @@ class StagedTrainer:
         total_vf = 0.0
         total_binned = 0.0
         total_smooth = 0.0
+        total_collapse = 0.0
+        total_s_std = 0.0
+        total_corr = 0.0
         num_batches = 0
 
         for i, batch in enumerate(dataloader):
@@ -918,11 +983,16 @@ class StagedTrainer:
                 x = batch
             x = x.to(self.device)
 
-            # Forward through transform (gauge-fixing handles normalization)
-            z = self.transform(x)
+            # Forward through transform, getting BOTH gauge-fixed output AND pre-normalized
+            # The pre-normalized output `s` is crucial for detecting collapse
+            result = self.transform(x, return_prenorm=True)
+            if isinstance(result, tuple):
+                z, s = result[0], result[1]
+            else:
+                z = result
+                s = z  # Fallback if transform doesn't support return_prenorm
 
-            # Get denoiser predictions directly on z (no additional normalization)
-            # The transform's gauge-fixing should already produce ~N(0,1) output
+            # Get denoiser predictions
             with torch.no_grad():
                 z_hat = self.denoiser(z)
 
@@ -944,9 +1014,19 @@ class StagedTrainer:
                 x_samples=x,
             )
 
-            # Add smoothness regularization to prevent oscillatory derivatives
+            # Smoothness regularization
             smooth_loss = self._compute_smoothness_loss(x, log_deriv)
-            total = losses["total"] + self.config.lambda_smooth * smooth_loss
+
+            # CRITICAL: Collapse prevention loss on pre-normalized output
+            # This directly monitors the RQS output before gauge-fixing hides collapse
+            collapse_loss, collapse_metrics = self._compute_collapse_loss(s, x)
+
+            # Total loss
+            total = (
+                losses["total"]
+                + self.config.lambda_smooth * smooth_loss
+                + self.config.lambda_collapse * collapse_loss
+            )
 
             # Backward
             optimizer.zero_grad()
@@ -962,14 +1042,21 @@ class StagedTrainer:
             total_vf += losses.get("vf", 0.0)
             total_binned += losses.get("binned", 0.0)
             total_smooth += smooth_loss.item()
+            total_collapse += collapse_loss.item()
+            total_s_std += collapse_metrics["s_std"]
+            total_corr += collapse_metrics["correlation"]
             num_batches += 1
 
+        n = max(num_batches, 1)
         return {
-            "loss": total_loss / max(num_batches, 1),
-            "homo": total_homo / max(num_batches, 1),
-            "vf": total_vf / max(num_batches, 1),
-            "binned": total_binned / max(num_batches, 1),
-            "smooth": total_smooth / max(num_batches, 1),
+            "loss": total_loss / n,
+            "homo": total_homo / n,
+            "vf": total_vf / n,
+            "binned": total_binned / n,
+            "smooth": total_smooth / n,
+            "collapse": total_collapse / n,
+            "s_std": total_s_std / n,  # Pre-normalized output std (should be > 0.5)
+            "corr": total_corr / n,    # Input-output correlation (should be ~1)
         }
 
     def _train_joint_epoch(
@@ -982,7 +1069,7 @@ class StagedTrainer:
         """Train both models jointly for one epoch.
 
         In Stage 3, the denoiser adapts to the actual z-space distribution.
-        No additional normalization - rely on transform's gauge-fixing.
+        Collapse prevention loss continues to ensure transform doesn't collapse.
         """
         self._unfreeze_module(self.transform)
         self._unfreeze_module(self.denoiser)
@@ -991,7 +1078,9 @@ class StagedTrainer:
         total_d_loss = 0.0
         total_homo = 0.0
         total_binned = 0.0
-        total_smooth = 0.0
+        total_collapse = 0.0
+        total_s_std = 0.0
+        total_corr = 0.0
         num_batches = 0
 
         for i, batch in enumerate(dataloader):
@@ -1006,7 +1095,14 @@ class StagedTrainer:
 
             # === Transform step ===
             self.denoiser.eval()
-            z = self.transform(x)
+
+            # Get both gauge-fixed and pre-normalized output
+            result = self.transform(x, return_prenorm=True)
+            if isinstance(result, tuple):
+                z, s = result[0], result[1]
+            else:
+                z = result
+                s = z
 
             with torch.no_grad():
                 z_hat = self.denoiser(z)
@@ -1023,9 +1119,17 @@ class StagedTrainer:
                 log_deriv=log_deriv, x_samples=x,
             )
 
-            # Add smoothness regularization
+            # Smoothness regularization
             smooth_loss = self._compute_smoothness_loss(x, log_deriv)
-            t_total = t_losses["total"] + self.config.lambda_smooth * smooth_loss
+
+            # Collapse prevention
+            collapse_loss, collapse_metrics = self._compute_collapse_loss(s, x)
+
+            t_total = (
+                t_losses["total"]
+                + self.config.lambda_smooth * smooth_loss
+                + self.config.lambda_collapse * collapse_loss
+            )
 
             transform_optimizer.zero_grad()
             t_total.backward()
@@ -1053,16 +1157,22 @@ class StagedTrainer:
 
             total_t_loss += t_total.item()
             total_d_loss += d_loss.item()
-            total_smooth += smooth_loss.item()
             total_homo += t_losses.get("homo", 0.0)
             total_binned += t_losses.get("binned", 0.0)
+            total_collapse += collapse_loss.item()
+            total_s_std += collapse_metrics["s_std"]
+            total_corr += collapse_metrics["correlation"]
             num_batches += 1
 
+        n = max(num_batches, 1)
         return {
-            "transform_loss": total_t_loss / max(num_batches, 1),
-            "denoiser_loss": total_d_loss / max(num_batches, 1),
-            "homo": total_homo / max(num_batches, 1),
-            "binned": total_binned / max(num_batches, 1),
+            "transform_loss": total_t_loss / n,
+            "denoiser_loss": total_d_loss / n,
+            "homo": total_homo / n,
+            "binned": total_binned / n,
+            "collapse": total_collapse / n,
+            "s_std": total_s_std / n,
+            "corr": total_corr / n,
         }
 
     def _log_history(
@@ -1187,7 +1297,8 @@ class StagedTrainer:
                     f"Stage 2 Epoch {epoch}/{self.config.vst_epochs} "
                     f"T_loss={results['loss']:.4f} "
                     f"binned={results['binned']:.4f} "
-                    f"homo={results['homo']:.6f}"
+                    f"s_std={results.get('s_std', 0):.3f} "
+                    f"corr={results.get('corr', 0):.3f}"
                 )
 
             if callback:
@@ -1236,7 +1347,8 @@ class StagedTrainer:
                         f"Stage 3 Epoch {epoch}/{self.config.refine_epochs} "
                         f"T_loss={results['transform_loss']:.4f} "
                         f"D_loss={results['denoiser_loss']:.4f} "
-                        f"binned={results['binned']:.4f}"
+                        f"s_std={results.get('s_std', 0):.3f} "
+                        f"corr={results.get('corr', 0):.3f}"
                     )
 
                 if callback:
