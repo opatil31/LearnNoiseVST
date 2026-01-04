@@ -493,15 +493,13 @@ def validate_noise_model(
     for group_id, data in calibration_data:
         z_hat = data.z_hat[:n_samples]
         r_real = data.r[:n_samples]
+        B = len(z_hat)
 
-        # Sample from model
-        if sampler.is_image:
-            # Reshape for image format
-            z_hat_reshaped = z_hat.reshape(-1, 1, 1, 1)
-            r_sampled = sampler._sample_image(z_hat_reshaped).flatten()
-        else:
-            z_hat_reshaped = z_hat.reshape(-1, 1)
-            r_sampled = sampler._sample_tabular(z_hat_reshaped).flatten()
+        # Sample standardized noise for this group
+        u = sampler.marginals.sample(group_id, B)
+
+        # Destandardize to get residuals
+        r_sampled = sampler.location_scale.destandardize(group_id, z_hat, u)
 
         # Moment comparison
         result = {

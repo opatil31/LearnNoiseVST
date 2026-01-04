@@ -25,7 +25,7 @@ from .copula import (
     CopulaFitResult,
     GaussianCopula,
     IndependenceCopula,
-    test_independence,
+    check_independence,
     choose_copula,
 )
 
@@ -59,7 +59,7 @@ __all__ = [
     "CopulaFitResult",
     "GaussianCopula",
     "IndependenceCopula",
-    "test_independence",
+    "check_independence",
     "choose_copula",
     # Sampler
     "NoiseModelConfig",

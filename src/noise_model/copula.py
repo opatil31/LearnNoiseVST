@@ -388,12 +388,12 @@ class IndependenceCopula:
         return u
 
 
-def test_independence(
+def check_independence(
     u_matrix: np.ndarray,
     alpha: float = 0.05,
 ) -> Tuple[bool, Dict]:
     """
-    Test if groups are approximately independent.
+    Check if groups are approximately independent.
 
     Uses pairwise correlation tests.
 
@@ -461,7 +461,7 @@ def choose_copula(
     Returns:
         Fitted copula (either independence or Gaussian).
     """
-    is_independent, details = test_independence(u_matrix)
+    is_independent, details = check_independence(u_matrix)
 
     max_corr = details['max_abs_correlation']
 
