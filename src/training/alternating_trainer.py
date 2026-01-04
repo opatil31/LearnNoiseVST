@@ -56,6 +56,7 @@ class TrainerConfig:
     # Loss weights
     lambda_homo: float = 1.0
     lambda_vf: float = 0.1
+    lambda_binned: float = 10.0  # Strong weight for binned variance loss
     lambda_shape: float = 0.1
     lambda_reg: float = 0.01
     lambda_prox: float = 0.1
@@ -143,6 +144,7 @@ class AlternatingTrainer:
             "denoiser_loss": [],
             "homo_loss": [],
             "vf_loss": [],
+            "binned_loss": [],
             "mse_loss": [],
         }
 
@@ -154,6 +156,7 @@ class AlternatingTrainer:
             num_features=num_features,
             lambda_homo=self.config.lambda_homo,
             lambda_vf=self.config.lambda_vf,
+            lambda_binned=self.config.lambda_binned,
             lambda_shape=self.config.lambda_shape,
             lambda_reg=self.config.lambda_reg,
         )
@@ -226,6 +229,7 @@ class AlternatingTrainer:
         total_loss = 0.0
         total_homo = 0.0
         total_vf = 0.0
+        total_binned = 0.0
         num_batches = 0
 
         for i, batch in enumerate(dataloader):
@@ -256,11 +260,13 @@ class AlternatingTrainer:
                 log_deriv = None
 
             # Compute transform loss
+            # Pass x_samples for binned variance loss (bins by input signal level)
             losses = self.transform_loss_fn(
                 z=z,
                 z_hat=z_hat,
                 residuals=residuals,
                 log_deriv=log_deriv,
+                x_samples=x,
             )
 
             # Add proximity regularization
@@ -284,17 +290,20 @@ class AlternatingTrainer:
             total_loss += total.item()
             total_homo += losses.get("homo", 0.0)
             total_vf += losses.get("vf", 0.0)
+            total_binned += losses.get("binned", 0.0)
             num_batches += 1
 
         # Average losses
         avg_loss = total_loss / max(num_batches, 1)
         avg_homo = total_homo / max(num_batches, 1)
         avg_vf = total_vf / max(num_batches, 1)
+        avg_binned = total_binned / max(num_batches, 1)
 
         # Log
         self.diagnostics.convergence.log_losses(avg_loss, 0.0, {
             "homo": avg_homo,
             "vf": avg_vf,
+            "binned": avg_binned,
         })
         self.diagnostics.convergence.log_gradients(self.transform, self.denoiser)
 
@@ -302,6 +311,7 @@ class AlternatingTrainer:
             "loss": avg_loss,
             "homo": avg_homo,
             "vf": avg_vf,
+            "binned": avg_binned,
         }
 
     def train_denoiser_step(
@@ -419,6 +429,7 @@ class AlternatingTrainer:
             self.history["transform_loss"].append(transform_results["loss"])
             self.history["homo_loss"].append(transform_results["homo"])
             self.history["vf_loss"].append(transform_results["vf"])
+            self.history["binned_loss"].append(transform_results["binned"])
 
             # Save reference for next iteration's proximity
             self._save_transform_reference()
