@@ -143,6 +143,113 @@ class HomoscedasticityLoss(nn.Module):
         return basis
 
 
+class BinnedVarianceLoss(nn.Module):
+    """
+    Direct binned variance loss for variance stabilization.
+
+    This loss directly penalizes the coefficient of variation of
+    residual variances across signal level bins. Unlike the kernel-smoothed
+    approach, this provides stronger gradients.
+
+    L = CV(σ²_bins) = std(σ²_bins) / mean(σ²_bins)
+
+    This loss is minimized when variance is constant across all signal levels.
+
+    IMPORTANT: Bins by input x (before transform), not z_hat, to provide
+    proper gradients for the transform. The transform affects residual
+    variance at each input level, and binning by x makes this gradient clear.
+
+    Args:
+        num_bins: Number of bins for signal levels.
+        min_samples_per_bin: Minimum samples required per bin.
+        use_log_var: If True, compute CV of log-variances (more stable).
+    """
+
+    def __init__(
+        self,
+        num_bins: int = 10,
+        min_samples_per_bin: int = 50,
+        use_log_var: bool = True,
+    ):
+        super().__init__()
+        self.num_bins = num_bins
+        self.min_samples_per_bin = min_samples_per_bin
+        self.use_log_var = use_log_var
+
+    def forward(
+        self,
+        z_hat: torch.Tensor,
+        residuals: torch.Tensor,
+        x: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute binned variance loss.
+
+        Args:
+            z_hat: Predicted signal [B, ...].
+            residuals: Residuals r = z - ẑ [B, ...].
+            x: Optional input data for binning. If None, uses z_hat.
+
+        Returns:
+            Loss value (CV of binned variances).
+        """
+        r_flat = residuals.flatten()
+        device = r_flat.device
+
+        # Use x for binning if provided (better gradients), otherwise use z_hat
+        if x is not None:
+            bin_signal = x.flatten().detach()  # Don't backprop through bin assignments
+        else:
+            bin_signal = z_hat.flatten().detach()
+
+        n = bin_signal.shape[0]
+
+        # Compute bin edges using quantiles
+        with torch.no_grad():
+            percentiles = torch.linspace(0, 100, self.num_bins + 1, device=device)
+            bin_edges = torch.stack([
+                torch.quantile(bin_signal, p / 100.0) for p in percentiles
+            ])
+
+        # Compute variance in each bin using soft assignments
+        bin_variances = []
+
+        for i in range(self.num_bins):
+            # Soft bin membership using sigmoid
+            left_edge = bin_edges[i]
+            right_edge = bin_edges[i + 1]
+            bin_width = (right_edge - left_edge).clamp(min=1e-6)
+
+            # Soft membership: 1 inside bin, smooth falloff outside
+            steepness = 10.0 / bin_width
+            left_mask = torch.sigmoid(steepness * (bin_signal - left_edge))
+            right_mask = torch.sigmoid(steepness * (right_edge - bin_signal))
+            weights = left_mask * right_mask
+
+            # Weighted variance computation
+            weights_sum = weights.sum() + 1e-8
+
+            if weights_sum > self.min_samples_per_bin:
+                weighted_mean = (weights * r_flat).sum() / weights_sum
+                weighted_var = (weights * (r_flat - weighted_mean) ** 2).sum() / weights_sum
+                bin_variances.append(weighted_var.clamp(min=1e-8))
+
+        if len(bin_variances) < 2:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        bin_vars = torch.stack(bin_variances)
+
+        if self.use_log_var:
+            # CV of log-variances (more numerically stable)
+            log_vars = torch.log(bin_vars)
+            cv = log_vars.std() / (log_vars.abs().mean() + 1e-8)
+        else:
+            # CV of raw variances
+            cv = bin_vars.std() / (bin_vars.mean() + 1e-8)
+
+        return cv
+
+
 class VarianceFlatnessLoss(nn.Module):
     """
     Variance flatness functional J[T].
@@ -494,12 +601,13 @@ class CombinedTransformLoss(nn.Module):
     """
     Combined loss for transform optimization.
 
-    L_T = λ_homo * L_homo + λ_vf * J[T] + λ_shape * L_shape + λ_reg * L_reg
+    L_T = λ_homo * L_homo + λ_vf * J[T] + λ_binned * L_binned + λ_shape * L_shape + λ_reg * L_reg
 
     Args:
         num_features: Number of features (for initialization).
         lambda_homo: Weight for homoscedasticity loss.
-        lambda_vf: Weight for variance flatness.
+        lambda_vf: Weight for variance flatness (kernel-smoothed).
+        lambda_binned: Weight for binned variance loss (more robust).
         lambda_shape: Weight for shape penalty.
         lambda_reg: Weight for regularization.
         basis_degree: Polynomial degree for L_homo.
@@ -512,6 +620,7 @@ class CombinedTransformLoss(nn.Module):
         num_features: int = 1,
         lambda_homo: float = 1.0,
         lambda_vf: float = 0.5,
+        lambda_binned: float = 10.0,  # New: strong weight for binned variance
         lambda_shape: float = 0.1,
         lambda_reg: float = 0.01,
         basis_degree: int = 2,
@@ -527,11 +636,13 @@ class CombinedTransformLoss(nn.Module):
         self.num_features = num_features
         self.lambda_homo = lambda_homo
         self.lambda_vf = lambda_vf
+        self.lambda_binned = lambda_binned
         self.lambda_shape = lambda_shape
         self.lambda_reg = lambda_reg
 
         self.homo_loss = HomoscedasticityLoss(basis_degree=basis_degree)
         self.vf_loss = VarianceFlatnessLoss(bandwidth=vf_bandwidth)
+        self.binned_loss = BinnedVarianceLoss(num_bins=10, use_log_var=True)
         self.shape_loss = ShapePenalty(kurt_weight=kurt_weight)
         self.reg_loss = TransformRegularization(
             smoothness_weight=smoothness_weight,
@@ -582,13 +693,22 @@ class CombinedTransformLoss(nn.Module):
             losses['homo'] = 0.0
             homo_tensor = torch.tensor(0.0, device=z_hat.device)
 
-        # Variance flatness
+        # Variance flatness (kernel-smoothed)
         if self.lambda_vf > 0:
             losses['vf'] = self.vf_loss(z_hat, residuals).item()
             vf_tensor = self.vf_loss(z_hat, residuals)
         else:
             losses['vf'] = 0.0
             vf_tensor = torch.tensor(0.0, device=z_hat.device)
+
+        # Binned variance loss (more robust)
+        # Pass x_samples for binning by input signal level (better gradients)
+        if self.lambda_binned > 0:
+            binned_tensor = self.binned_loss(z_hat, residuals, x=x_samples)
+            losses['binned'] = binned_tensor.item()
+        else:
+            losses['binned'] = 0.0
+            binned_tensor = torch.tensor(0.0, device=z_hat.device)
 
         # Shape penalty
         if self.lambda_shape > 0:
@@ -613,6 +733,7 @@ class CombinedTransformLoss(nn.Module):
         total = (
             self.lambda_homo * homo_tensor +
             self.lambda_vf * vf_tensor +
+            self.lambda_binned * binned_tensor +
             self.lambda_shape * shape_tensor +
             self.lambda_reg * reg_tensor
         )
