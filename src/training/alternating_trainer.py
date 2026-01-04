@@ -893,9 +893,10 @@ class StagedTrainer:
     ) -> Dict[str, float]:
         """Train transform for one epoch with frozen denoiser.
 
-        Key fix: Normalize z to N(0,1) before feeding to denoiser, since the
-        denoiser was pre-trained on N(0,1) input. This ensures the denoiser
-        operates in its expected input domain.
+        The transform's built-in gauge-fixing already normalizes output to N(0,1).
+        We rely on that instead of additional batch normalization, so that if the
+        transform collapses, the denoiser will see non-standard input and fail,
+        providing gradient signal to fix the collapse.
         """
         self._unfreeze_module(self.transform)
         self._freeze_module(self.denoiser)
@@ -917,23 +918,15 @@ class StagedTrainer:
                 x = batch
             x = x.to(self.device)
 
-            # Forward through transform
+            # Forward through transform (gauge-fixing handles normalization)
             z = self.transform(x)
 
-            # CRITICAL FIX: Normalize z to N(0,1) before denoiser
-            # The denoiser was pre-trained on N(0,1) input, so we must match that
-            z_mean = z.mean(dim=0, keepdim=True)
-            z_std = z.std(dim=0, keepdim=True).clamp(min=1e-6)
-            z_normalized = (z - z_mean) / z_std
-
-            # Get denoiser predictions on normalized input (no grad)
+            # Get denoiser predictions directly on z (no additional normalization)
+            # The transform's gauge-fixing should already produce ~N(0,1) output
             with torch.no_grad():
-                z_hat_normalized = self.denoiser(z_normalized)
+                z_hat = self.denoiser(z)
 
-            # Denormalize z_hat back to original scale
-            z_hat = z_hat_normalized * z_std + z_mean
-
-            # Compute residuals in original scale
+            # Compute residuals
             residuals = z - z_hat
 
             # Get log derivatives for smoothness regularization
@@ -989,8 +982,7 @@ class StagedTrainer:
         """Train both models jointly for one epoch.
 
         In Stage 3, the denoiser adapts to the actual z-space distribution.
-        We still use normalization for consistent loss computation, but the
-        denoiser learns the actual data distribution.
+        No additional normalization - rely on transform's gauge-fixing.
         """
         self._unfreeze_module(self.transform)
         self._unfreeze_module(self.denoiser)
@@ -1016,15 +1008,9 @@ class StagedTrainer:
             self.denoiser.eval()
             z = self.transform(x)
 
-            # Normalize z for denoiser (consistent with Stage 2)
-            z_mean = z.mean(dim=0, keepdim=True)
-            z_std = z.std(dim=0, keepdim=True).clamp(min=1e-6)
-            z_normalized = (z - z_mean) / z_std
-
             with torch.no_grad():
-                z_hat_normalized = self.denoiser(z_normalized)
+                z_hat = self.denoiser(z)
 
-            z_hat = z_hat_normalized * z_std + z_mean
             residuals = z - z_hat
 
             if hasattr(self.transform, 'log_derivative'):
@@ -1053,14 +1039,9 @@ class StagedTrainer:
 
             with torch.no_grad():
                 z = self.transform(x)
-                # Use same normalization for denoiser training
-                z_mean = z.mean(dim=0, keepdim=True)
-                z_std = z.std(dim=0, keepdim=True).clamp(min=1e-6)
-                z_normalized = (z - z_mean) / z_std
 
-            z_hat_normalized = self.denoiser(z_normalized)
-            # Loss in normalized space
-            d_loss = torch.nn.functional.mse_loss(z_hat_normalized, z_normalized.detach())
+            z_hat = self.denoiser(z)
+            d_loss, _ = self.denoiser_loss_fn(z, z_hat)
 
             denoiser_optimizer.zero_grad()
             d_loss.backward()
