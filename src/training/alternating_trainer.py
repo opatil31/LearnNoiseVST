@@ -581,15 +581,25 @@ class StagedTrainerConfig:
     Configuration for staged training approach.
 
     Staged training improves VST learning by providing clearer gradient signals:
-    - Stage 1 (Warmup): Train denoiser only, transform frozen
+    - Stage 1 (Warmup): Train denoiser with SYNTHETIC GAUSSIAN noise (key insight!)
     - Stage 2 (VST Focus): Train VST only, denoiser frozen (key insight from Noise2VST)
     - Stage 3 (Refinement): Joint fine-tuning with low learning rates
+
+    The key insight from Noise2VST is that the frozen denoiser should EXPECT
+    homoscedastic (Gaussian) input. If trained on heteroscedastic data, the
+    denoiser adapts and removes the VST learning signal.
+
+    By training Stage 1 with synthetic Gaussian noise:
+    - Denoiser learns to expect homoscedastic input
+    - In Stage 2, if VST doesn't stabilize variance, denoiser performs poorly
+    - This creates strong gradient signal for VST to learn proper stabilization
     """
 
-    # Stage 1: Denoiser warmup (transform frozen)
+    # Stage 1: Denoiser warmup with SYNTHETIC GAUSSIAN noise
     warmup_epochs: int = 20
     warmup_denoiser_lr: float = 1e-3
     warmup_inner_iters: int = 500
+    warmup_noise_std: float = 1.0  # Synthetic Gaussian noise std for Stage 1
 
     # Stage 2: VST focus (denoiser frozen) - key stage for learning good VST
     vst_epochs: int = 50
@@ -625,22 +635,26 @@ class StagedTrainerConfig:
 
 class StagedTrainer:
     """
-    Staged training for VST learning.
+    Staged training for VST learning with synthetic Gaussian noise pre-training.
 
-    This trainer implements the key insight from Noise2VST: freezing the denoiser
-    during VST training provides clearer gradient signals for variance stabilization.
+    This trainer implements key insights from Noise2VST:
+    1. The frozen denoiser should EXPECT homoscedastic (Gaussian) input
+    2. Freezing the denoiser during VST training provides clear gradient signals
 
-    Unlike full Noise2VST (which uses a pre-trained Gaussian denoiser), this approach:
-    1. Trains the denoiser on our actual data first (domain-agnostic)
-    2. Freezes it to train the VST (clear gradients)
-    3. Optionally fine-tunes both together
-
-    This preserves noise characterization capability while improving VST learning.
+    The key innovation is Stage 1: instead of training the denoiser on the actual
+    heteroscedastic data (which allows it to adapt), we train it with SYNTHETIC
+    GAUSSIAN noise. This ensures:
+    - Denoiser learns to denoise homoscedastic noise
+    - In Stage 2, if VST doesn't stabilize variance, denoiser performs poorly
+    - Poor denoiser performance → high loss → strong VST gradient signal
 
     Training Stages:
-        Stage 1 (Warmup): Train denoiser with identity transform
+        Stage 1 (Warmup): Train denoiser with SYNTHETIC GAUSSIAN noise
         Stage 2 (VST Focus): Freeze denoiser, train VST (key improvement)
         Stage 3 (Refinement): Joint fine-tuning with low learning rates
+
+    This preserves noise characterization capability while fixing the VST
+    learning failure mode observed with heteroscedastic Stage 1 training.
 
     Args:
         transform: The monotone transform module.
@@ -720,13 +734,81 @@ class StagedTrainer:
         for param in module.parameters():
             param.requires_grad = True
 
+    def _train_denoiser_epoch_synthetic(
+        self,
+        dataloader: DataLoader,
+        optimizer: optim.Optimizer,
+        max_iters: int,
+        noise_std: float,
+    ) -> Dict[str, float]:
+        """
+        Train denoiser for one epoch with SYNTHETIC GAUSSIAN noise.
+
+        This is the key innovation for Stage 1: instead of using the natural
+        heteroscedastic noise in the data, we add synthetic homoscedastic
+        Gaussian noise. This ensures the denoiser learns to expect constant
+        variance input.
+
+        Args:
+            dataloader: Data loader
+            optimizer: Denoiser optimizer
+            max_iters: Max iterations per epoch
+            noise_std: Standard deviation of synthetic Gaussian noise
+        """
+        self._freeze_module(self.transform)
+        self._unfreeze_module(self.denoiser)
+
+        total_loss = 0.0
+        total_mse = 0.0
+        num_batches = 0
+
+        for i, batch in enumerate(dataloader):
+            if i >= max_iters:
+                break
+
+            if isinstance(batch, (tuple, list)):
+                x = batch[0]
+            else:
+                x = batch
+            x = x.to(self.device)
+
+            # Forward through frozen transform to get "clean" signal
+            with torch.no_grad():
+                z_clean = self.transform(x)
+
+            # Add SYNTHETIC GAUSSIAN noise (homoscedastic!)
+            # This is the key: denoiser learns to expect constant variance
+            synthetic_noise = torch.randn_like(z_clean) * noise_std
+            z_noisy = z_clean + synthetic_noise
+
+            # Denoiser tries to predict clean from noisy
+            z_hat = self.denoiser(z_noisy)
+
+            # Loss: MSE between prediction and clean signal
+            loss = torch.nn.functional.mse_loss(z_hat, z_clean)
+
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.denoiser.parameters(), 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_mse += loss.item()
+            num_batches += 1
+
+        return {
+            "loss": total_loss / max(num_batches, 1),
+            "mse": total_mse / max(num_batches, 1),
+        }
+
     def _train_denoiser_epoch(
         self,
         dataloader: DataLoader,
         optimizer: optim.Optimizer,
         max_iters: int,
     ) -> Dict[str, float]:
-        """Train denoiser for one epoch with frozen transform."""
+        """Train denoiser for one epoch on actual data (used in Stage 3)."""
         self._freeze_module(self.transform)
         self._unfreeze_module(self.denoiser)
 
@@ -960,18 +1042,20 @@ class StagedTrainer:
         Returns:
             Training result dictionary with history.
         """
-        logger.info("Starting staged training")
-        logger.info(f"Stage 1: {self.config.warmup_epochs} epochs denoiser warmup")
+        logger.info("Starting staged training with SYNTHETIC GAUSSIAN noise in Stage 1")
+        logger.info(f"Stage 1: {self.config.warmup_epochs} epochs denoiser warmup (synthetic noise σ={self.config.warmup_noise_std})")
         logger.info(f"Stage 2: {self.config.vst_epochs} epochs VST training (frozen denoiser)")
         logger.info(f"Stage 3: {self.config.refine_epochs} epochs joint refinement")
 
         start_time = time.time()
         global_epoch = 0
 
-        # ===== STAGE 1: Denoiser Warmup =====
+        # ===== STAGE 1: Denoiser Warmup with SYNTHETIC GAUSSIAN noise =====
         self.current_stage = 1
         logger.info("\n" + "=" * 60)
-        logger.info("STAGE 1: Denoiser Warmup (transform frozen)")
+        logger.info("STAGE 1: Denoiser Warmup with SYNTHETIC GAUSSIAN noise")
+        logger.info(f"  Noise std: {self.config.warmup_noise_std}")
+        logger.info("  Key insight: Denoiser learns to expect homoscedastic input")
         logger.info("=" * 60)
 
         denoiser_optimizer = optim.Adam(
@@ -980,9 +1064,11 @@ class StagedTrainer:
         )
 
         for epoch in range(self.config.warmup_epochs):
-            results = self._train_denoiser_epoch(
+            # Use synthetic Gaussian noise training!
+            results = self._train_denoiser_epoch_synthetic(
                 dataloader, denoiser_optimizer,
                 max_iters=self.config.warmup_inner_iters,
+                noise_std=self.config.warmup_noise_std,
             )
 
             self._log_history(

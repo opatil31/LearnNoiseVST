@@ -511,6 +511,12 @@ def main():
         help='Stage 3: Joint refinement epochs'
     )
     parser.add_argument(
+        '--noise_std',
+        type=float,
+        default=1.0,
+        help='Stage 1: Synthetic Gaussian noise std (key for Noise2VST-style training)'
+    )
+    parser.add_argument(
         '--batch_size',
         type=int,
         default=256,
@@ -565,19 +571,23 @@ def main():
 
     if verbose:
         print("=" * 60)
-        print("STAGED VST Experiment")
+        print("STAGED VST Experiment (with Synthetic Gaussian Noise)")
         print("=" * 60)
         print(f"Device: {device}")
         print(f"Dataset: {args.dataset}")
         print(f"Samples: {args.n_samples}, Features: {args.n_features}")
         print(f"Training Stages:")
-        print(f"  Stage 1 (Warmup):  {args.warmup_epochs} epochs")
-        print(f"  Stage 2 (VST):     {args.vst_epochs} epochs")
+        print(f"  Stage 1 (Warmup):  {args.warmup_epochs} epochs (synthetic noise σ={args.noise_std})")
+        print(f"  Stage 2 (VST):     {args.vst_epochs} epochs (frozen denoiser)")
         print(f"  Stage 3 (Refine):  {args.refine_epochs} epochs")
+        print(f"\nKey insight: Stage 1 uses SYNTHETIC Gaussian noise so denoiser")
+        print(f"             expects homoscedastic input. This creates strong")
+        print(f"             gradient signal for VST learning in Stage 2.")
 
     # Create staged training config
     config = StagedTrainerConfig(
         warmup_epochs=args.warmup_epochs,
+        warmup_noise_std=args.noise_std,  # Key parameter!
         vst_epochs=args.vst_epochs,
         refine_epochs=args.refine_epochs,
         batch_size=args.batch_size,
