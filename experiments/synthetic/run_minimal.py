@@ -27,9 +27,8 @@ import torch.nn as nn
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.transform.rqs import RQSTransform
-from src.transform.gauge_fixing import GaugeFixingModule
-from src.denoiser.blind_spot import ColumnMaskedMLP
+from src.transforms import MonotoneFeatureTransform
+from src.denoisers import LightweightTabularDenoiser
 from src.training.losses import CombinedTransformLoss, DenoiserLoss
 from src.training.alternating_trainer import AlternatingTrainer, TrainerConfig
 from src.noise_model import NoiseModelSampler
@@ -59,41 +58,29 @@ from experiments.synthetic.generate_data import (
 def create_model(
     n_features: int,
     n_bins: int = 8,
-    hidden_dims: list = None,
+    hidden_dim: int = 64,
     device: str = 'cpu',
 ) -> Dict[str, nn.Module]:
     """Create transform and denoiser models."""
-    if hidden_dims is None:
-        hidden_dims = [64, 64]
-
-    # RQS Transform with gauge fixing
-    rqs = RQSTransform(
-        dim=n_features,
-        n_bins=n_bins,
-        init_scale=0.1,
-    )
-    gauge = GaugeFixingModule(
-        dim=n_features,
-        method='soft',
-        target_mean=0.0,
-        target_std=1.0,
+    # MonotoneFeatureTransform includes RQS with gauge fixing (running stats)
+    transform = MonotoneFeatureTransform(
+        num_features=n_features,
+        num_bins=n_bins,
+        track_running_stats=True,
     )
 
     # Blind-spot denoiser
-    denoiser = ColumnMaskedMLP(
-        input_dim=n_features,
-        hidden_dims=hidden_dims,
-        output_dim=n_features,
+    denoiser = LightweightTabularDenoiser(
+        num_features=n_features,
+        hidden_dim=hidden_dim,
     )
 
     # Move to device
-    rqs = rqs.to(device)
-    gauge = gauge.to(device)
+    transform = transform.to(device)
     denoiser = denoiser.to(device)
 
     return {
-        'rqs': rqs,
-        'gauge': gauge,
+        'transform': transform,
         'denoiser': denoiser,
     }
 
@@ -127,13 +114,20 @@ def run_experiment(
     )
 
     # Prepare data
-    y_train = torch.tensor(dataset.x, dtype=torch.float32).to(device)
+    from torch.utils.data import TensorDataset, DataLoader
+
+    y_train = torch.tensor(dataset.x, dtype=torch.float32)
+    train_dataset = TensorDataset(y_train)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.transform_batch_size,
+        shuffle=True,
+    )
 
     # Create trainer
     trainer = AlternatingTrainer(
-        transform=models['rqs'],
+        transform=models['transform'],
         denoiser=models['denoiser'],
-        gauge_module=models['gauge'],
         config=config,
     )
 
@@ -141,19 +135,21 @@ def run_experiment(
     if verbose:
         print("\nTraining...")
 
-    history = trainer.train(
-        y_train,
-        verbose=verbose,
-    )
+    # Initialize transform normalization
+    models['transform'].set_input_normalization(y_train.to(device))
+
+    train_result = trainer.train(train_loader)
+    history = train_result["history"]
 
     # Evaluate
     if verbose:
         print("\nEvaluating...")
 
+    models['transform'].eval()
     with torch.no_grad():
-        # Apply learned transform
-        z_learned = models['rqs'](y_train)
-        z_learned = models['gauge'](z_learned)
+        # Apply learned transform (includes gauge fixing via running stats)
+        y_eval = y_train.to(device)
+        z_learned = models['transform'](y_eval, update_stats=False)
         z_learned_np = z_learned.cpu().numpy()
 
         # Get denoiser predictions
@@ -175,9 +171,13 @@ def run_experiment(
 
     # Oracle comparison if available
     if dataset.oracle_transform is not None:
-        oracle_z = dataset.oracle_transform(dataset.x)
+        def learned_transform_fn(x):
+            with torch.no_grad():
+                x_t = torch.tensor(x, dtype=torch.float32).to(device)
+                return models['transform'](x_t, update_stats=False).cpu().numpy()
+
         oracle_result = compare_with_oracle(
-            learned_transform=lambda x: models['rqs'](torch.tensor(x, dtype=torch.float32).to(device)).detach().cpu().numpy(),
+            learned_transform=learned_transform_fn,
             oracle_transform=dataset.oracle_transform,
             x_test=dataset.x[:1000],  # Subsample for efficiency
         )
@@ -243,12 +243,8 @@ def save_results(
         model_dir.mkdir(exist_ok=True)
 
         torch.save(
-            results['models']['rqs'].state_dict(),
-            model_dir / 'rqs.pt'
-        )
-        torch.save(
-            results['models']['gauge'].state_dict(),
-            model_dir / 'gauge.pt'
+            results['models']['transform'].state_dict(),
+            model_dir / 'transform.pt'
         )
         torch.save(
             results['models']['denoiser'].state_dict(),
@@ -284,7 +280,7 @@ def create_visualizations(
     # 1. Transform comparison
     if dataset.oracle_transform is not None:
         fig = plot_transform_comparison(
-            learned_transform=results['models']['rqs'],
+            learned_transform=results['models']['transform'],
             oracle_transform=dataset.oracle_transform,
             x_range=(dataset.x.min(), dataset.x.max()),
             title=f'Transform Comparison: {dataset.noise_type}',
@@ -411,14 +407,12 @@ def main():
 
     # Create training config
     config = TrainerConfig(
-        n_epochs=args.epochs,
-        batch_size=args.batch_size,
+        num_outer_iters=args.epochs,
+        transform_batch_size=args.batch_size,
+        denoiser_batch_size=args.batch_size,
         transform_lr=1e-3,
         denoiser_lr=1e-3,
-        transform_epochs_per_cycle=1,
-        denoiser_epochs_per_cycle=1,
         lambda_homo=1.0,
-        lambda_gauge=0.1,
     )
 
     # Generate datasets
