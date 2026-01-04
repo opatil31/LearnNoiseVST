@@ -413,6 +413,7 @@ def main():
         transform_lr=1e-3,
         denoiser_lr=1e-3,
         lambda_homo=1.0,
+        device=device,
     )
 
     # Generate datasets

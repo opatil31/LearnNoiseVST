@@ -121,8 +121,9 @@ class MonotoneFeatureTransform(nn.Module):
             data_range = upper - lower
             data_range = torch.clamp(data_range, min=1e-8)
 
-            self.input_shift = (lower + upper) / 2
-            self.input_scale = data_range / (2 * self.bound)
+            # Update buffers in-place to maintain device placement
+            self.input_shift.copy_(((lower + upper) / 2).to(self.input_shift.device))
+            self.input_scale.copy_((data_range / (2 * self.bound)).to(self.input_scale.device))
 
             self._input_normalization_set = True
 
